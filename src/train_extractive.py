@@ -11,6 +11,7 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
+import random
 import torch
 import yaml
 from datasets import Dataset
@@ -47,6 +48,7 @@ def load_config(config_path: str) -> dict:
         "warmup_steps",
         "weight_decay",
         "gradient_accumulation_steps",
+        "dataset_fraction",
         "max_span_length",
         "confidence_threshold",
     ]
@@ -56,7 +58,11 @@ def load_config(config_path: str) -> dict:
             if key in ["learning_rate", "weight_decay", "confidence_threshold"]:
                 config[key] = float(config[key])
             else:
-                config[key] = int(config[key])
+                # dataset_fraction should be treated as float not int
+                if key == "dataset_fraction":
+                    config[key] = float(config[key])
+                else:
+                    config[key] = int(config[key])
     
     return config
 
@@ -277,6 +283,25 @@ def train_extractive_model(config_path: str = "configs/extractive_config.yaml"):
     logger.info(f"Loading validation data from {val_file}")
     val_data = load_jsonl(val_file)
     val_examples, val_features = create_qa_examples(val_data, "validation")
+
+    # Subsample datasets if configured (e.g., 0.05 for 5%)
+    dataset_fraction = config.get("dataset_fraction", 1.0)
+    if 0.0 < dataset_fraction < 1.0:
+        seed = config.get("seed", 42)
+        random.seed(seed)
+
+        n_train = max(1, int(len(train_examples) * dataset_fraction))
+        n_val = max(1, int(len(val_examples) * dataset_fraction))
+
+        logger.info(
+            f"Subsampling datasets to {dataset_fraction*100:.2f}% -> {n_train} train, {n_val} val"
+        )
+
+        # If dataset is small enough that sample would be the same size, skip
+        if n_train < len(train_examples):
+            train_examples = random.sample(train_examples, n_train)
+        if n_val < len(val_examples):
+            val_examples = random.sample(val_examples, n_val)
     
     # Convert to HuggingFace Dataset
     train_dataset = Dataset.from_dict({
@@ -335,7 +360,7 @@ def train_extractive_model(config_path: str = "configs/extractive_config.yaml"):
         logging_dir=config["log_dir"],
         logging_steps=100,
         save_strategy="epoch",
-        load_best_model_at_end=True,
+        load_best_model_at_end=False,
         seed=42,
         fp16=use_fp16,
         no_cuda=not use_cuda,

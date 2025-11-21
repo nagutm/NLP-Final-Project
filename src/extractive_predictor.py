@@ -79,19 +79,23 @@ class ExtractivePredictor:
                 "end_index": int,
             }
         """
-        # Tokenize
+        # Tokenize with proper handling of single examples (not batch)
+        # Ensure question and context are strings, not lists
+        if isinstance(question, (list, tuple)):
+            question = question[0] if question else ""
+        if isinstance(context, (list, tuple)):
+            context = context[0] if context else ""
+        
         inputs = self.tokenizer(
             question,
             context,
             truncation="only_second",
             max_length=self.max_seq_length,
             return_tensors="pt",
-            stride=128,
-            return_overflowing_tokens=True,
             return_offsets_mapping=True,
         )
         
-        offset_mapping = inputs.pop("offset_mapping").to(self.device)
+        offset_mapping = inputs.pop("offset_mapping")
         
         # Move to device
         input_ids = inputs["input_ids"].to(self.device)
@@ -125,17 +129,18 @@ class ExtractivePredictor:
             
             for start_idx in start_indices:
                 for end_idx in end_indices:
-                    start_idx = start_idx.item()
-                    end_idx = end_idx.item()
+                    # Convert tensor to int if needed
+                    start_idx_int = start_idx.item() if hasattr(start_idx, 'item') else int(start_idx)
+                    end_idx_int = end_idx.item() if hasattr(end_idx, 'item') else int(end_idx)
                     
                     # Ensure valid span
-                    if end_idx < start_idx or end_idx - start_idx + 1 > self.max_answer_length:
+                    if end_idx_int < start_idx_int or end_idx_int - start_idx_int + 1 > self.max_answer_length:
                         continue
                     
                     # Get confidence
                     confidence = (
-                        sample_start_logits[start_idx].item() + 
-                        sample_end_logits[end_idx].item()
+                        sample_start_logits[start_idx_int].item() + 
+                        sample_end_logits[end_idx_int].item()
                     ) / 2
                     
                     if confidence < self.confidence_threshold:
@@ -143,18 +148,17 @@ class ExtractivePredictor:
                     
                     # Get character positions
                     try:
-                        char_start = offset_mapping[sample_idx][start_idx][0].item()
-                        char_end = offset_mapping[sample_idx][end_idx][1].item()
-                        
+                        char_start = offset_mapping[sample_idx][start_idx_int][0].item()
+                        char_end = offset_mapping[sample_idx][end_idx_int][1].item()
                         answer = context[char_start:char_end]
                         
                         predictions.append({
                             "answer": answer,
                             "confidence": confidence,
-                            "start_logit": sample_start_logits[start_idx].item(),
-                            "end_logit": sample_end_logits[end_idx].item(),
-                            "start_index": start_idx,
-                            "end_index": end_idx,
+                            "start_logit": sample_start_logits[start_idx_int].item(),
+                            "end_logit": sample_end_logits[end_idx_int].item(),
+                            "start_index": start_idx_int,
+                            "end_index": end_idx_int,
                             "char_start": char_start,
                             "char_end": char_end,
                         })

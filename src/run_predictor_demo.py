@@ -1,0 +1,118 @@
+"""
+Demo script to run the extractive predictor on sample data.
+"""
+
+import json
+import sys
+import logging
+from pathlib import Path
+
+# Add parent directory to path to import src modules
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+from extractive_predictor import ExtractivePredictor
+from utils import load_jsonl
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+)
+logger = logging.getLogger(__name__)
+
+
+def run_predictor_demo():
+    """Run predictor on validation samples."""
+    
+    # Get absolute path to model
+    project_root = Path(__file__).parent.parent
+    model_path = project_root / "models" / "extractive_model" / "final_model"
+    
+    # Check if model exists
+    if not Path(model_path).exists():
+        logger.error(f"Model not found at {model_path}")
+        return
+    
+    logger.info("Loading predictor...")
+    predictor = ExtractivePredictor(
+        model_path=model_path,
+        max_seq_length=512,
+        max_answer_length=100,
+        confidence_threshold=0.0,
+    )
+    
+    # Load validation data
+    logger.info("Loading validation data...")
+    val_data_path = project_root / "data" / "validation.jsonl"
+    val_data = load_jsonl(str(val_data_path))
+    
+    # Run on first 5 examples
+    num_samples = min(5, len(val_data))
+    logger.info(f"Running predictions on {num_samples} samples...")
+    
+    for i, example in enumerate(val_data[:num_samples]):
+        logger.info(f"\n{'='*80}")
+        logger.info(f"Sample {i+1}/{num_samples}")
+        logger.info(f"{'='*80}")
+        
+        # Extract fields
+        post = example.get("postText", [])
+        if isinstance(post, list):
+            post = " ".join(post) if post else ""
+        
+        target_paragraphs = example.get("targetParagraphs", [])
+        article = " ".join(target_paragraphs) if isinstance(target_paragraphs, list) else target_paragraphs
+        
+        spoiler = example.get("spoiler", [])
+        if isinstance(spoiler, list):
+            spoiler = " ".join(spoiler) if spoiler else ""
+        
+        spoiler_type = example.get("tags", ["unknown"])
+        if isinstance(spoiler_type, list):
+            spoiler_type = spoiler_type[0] if spoiler_type else "unknown"
+        
+        # Truncate for display
+        post_display = (post[:100] + "...") if len(post) > 100 else post
+        article_display = (article[:150] + "...") if len(article) > 150 else article
+        spoiler_display = (spoiler[:100] + "...") if len(spoiler) > 100 else spoiler
+        
+        logger.info(f"Clickbait Post: {post_display}")
+        logger.info(f"Spoiler Type: {spoiler_type}")
+        logger.info(f"Article (first 150 chars): {article_display}")
+        logger.info(f"Ground Truth Spoiler: {spoiler_display}")
+        
+        # Run prediction
+        try:
+            predictions = predictor.predict(
+                question=post,
+                context=article,
+                top_k=3
+            )
+            
+            logger.info(f"\nTop Predictions:")
+            for j, pred in enumerate(predictions, 1):
+                logger.info(f"  {j}. Answer: '{pred['answer']}' (Confidence: {pred['confidence']:.4f})")
+                logger.info(f"     Char positions: {pred['char_start']}-{pred['char_end']}")
+            
+            # Check if prediction matches ground truth (partial match)
+            if predictions:
+                top_pred = predictions[0]['answer'].lower()
+                ground_truth = spoiler.lower()
+                match = top_pred in ground_truth or ground_truth in top_pred
+                logger.info(f"Match with ground truth: {'✓ YES' if match else '✗ NO'}")
+        
+        except Exception as e:
+            logger.error(f"Error during prediction: {e}")
+            import traceback
+            traceback.print_exc()
+    
+    logger.info(f"\n{'='*80}")
+    logger.info("Demo complete!")
+    logger.info(f"Model location: {model_path}")
+    logger.info("To use predictor in your own code:")
+    logger.info("  from src.extractive_predictor import ExtractivePredictor")
+    logger.info("  predictor = ExtractivePredictor('models/extractive_model/final_model')")
+    logger.info("  predictions = predictor.predict(question='...', context='...')")
+
+
+if __name__ == "__main__":
+    run_predictor_demo()

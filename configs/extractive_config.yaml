@@ -32,3 +32,5 @@ squad_dataset: "squad"
 # Inference Configuration
 max_span_length: 100
 confidence_threshold: 0.5
+# Fraction of dataset to use (0.0-1.0). Use 0.05 for 5%.
+dataset_fraction: 0.005

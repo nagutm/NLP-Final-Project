@@ -8,3 +8,6 @@ Train the model:
 
 Inference it:
 3) python src/run_predictor_demo.py 
+
+Evaluate bleu scores:
+4) python evaluate_bleu.py --predictions results/predictions.json

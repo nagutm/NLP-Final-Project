@@ -49,6 +49,9 @@ def run_predictor_demo():
     num_samples = min(5, len(val_data))
     logger.info(f"Running predictions on {num_samples} samples...")
     
+    # Store predictions for JSON output
+    results = []
+    
     for i, example in enumerate(val_data[:num_samples]):
         logger.info(f"\n{'='*80}")
         logger.info(f"Sample {i+1}/{num_samples}")
@@ -88,6 +91,16 @@ def run_predictor_demo():
                 top_k=3
             )
             
+            # Get top prediction
+            top_prediction = predictions[0]['answer'] if predictions else ""
+            
+            # Add to results
+            results.append({
+                "ground_truth": spoiler,
+                "top_prediction": top_prediction,
+                "spoiler_type": spoiler_type
+            })
+            
             logger.info(f"\nTop Predictions:")
             for j, pred in enumerate(predictions, 1):
                 logger.info(f"  {j}. Answer: '{pred['answer']}' (Confidence: {pred['confidence']:.4f})")
@@ -104,10 +117,27 @@ def run_predictor_demo():
             logger.error(f"Error during prediction: {e}")
             import traceback
             traceback.print_exc()
+            # Add error result
+            results.append({
+                "ground_truth": spoiler,
+                "top_prediction": "",
+                "spoiler_type": spoiler_type
+            })
     
     logger.info(f"\n{'='*80}")
     logger.info("Demo complete!")
     logger.info(f"Model location: {model_path}")
+    
+    # Save results to JSON file
+    output_path = project_root / "results" / "predictions.json"
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    
+    with open(output_path, 'w') as f:
+        json.dump(results, f, indent=2)
+    
+    logger.info(f"Results saved to: {output_path}")
+    logger.info(f"Total predictions: {len(results)}")
+    
     logger.info("To use predictor in your own code:")
     logger.info("  from src.extractive_predictor import ExtractivePredictor")
     logger.info("  predictor = ExtractivePredictor('models/extractive_model/final_model')")

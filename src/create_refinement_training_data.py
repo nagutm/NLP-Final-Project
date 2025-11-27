@@ -46,10 +46,15 @@ class ExtractivePredictor:
         logger.info(f"Loading extractive model from {model_path}")
         logger.info(f"Using device: {self.device}")
         
-        self.tokenizer = AutoTokenizer.from_pretrained(model_path)
-        self.model = AutoModelForQuestionAnswering.from_pretrained(model_path)
-        self.model.to(self.device)
-        self.model.eval()
+        # Add local_files_only=True to load from local path
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            model_path,
+            local_files_only=True
+        )
+        self.model = AutoModelForQuestionAnswering.from_pretrained(
+            model_path,
+            local_files_only=True
+        )
     
     def predict(self, question: str, context: str, max_length: int = 512) -> str:
         """Predict answer span."""

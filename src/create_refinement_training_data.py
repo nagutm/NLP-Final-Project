@@ -6,13 +6,12 @@ Generates (extractive_output, ground_truth) pairs for training refinement model.
 import json
 import logging
 import os
-import sys
 from typing import Dict, List
+from pathlib import Path
 
-import torch
 import yaml
 from tqdm import tqdm
-from transformers import AutoModelForQuestionAnswering, AutoTokenizer
+from extractive_predictor import ExtractivePredictor
 
 # Configure logging
 logging.basicConfig(
@@ -36,58 +35,6 @@ def load_jsonl(file_path: str) -> List[Dict]:
             if line.strip():
                 data.append(json.loads(line))
     return data
-
-
-class ExtractivePredictor:
-    """Generate extractive predictions for creating refinement training data."""
-    
-    def __init__(self, model_path: str, device: str = None):
-        self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
-        logger.info(f"Loading extractive model from {model_path}")
-        logger.info(f"Using device: {self.device}")
-        
-        # Add local_files_only=True to load from local path
-        self.tokenizer = AutoTokenizer.from_pretrained(
-            model_path,
-            local_files_only=True
-        )
-        self.model = AutoModelForQuestionAnswering.from_pretrained(
-            model_path,
-            local_files_only=True
-        )
-    
-    def predict(self, question: str, context: str, max_length: int = 512) -> str:
-        """Predict answer span."""
-        inputs = self.tokenizer(
-            question,
-            context,
-            max_length=max_length,
-            truncation="only_second",
-            padding="max_length",
-            return_tensors="pt",
-            return_offsets_mapping=True,
-        )
-        
-        offset_mapping = inputs.pop("offset_mapping")[0]
-        inputs = {k: v.to(self.device) for k, v in inputs.items()}
-        
-        with torch.no_grad():
-            outputs = self.model(**inputs)
-        
-        start_logits = outputs.start_logits[0].cpu()
-        end_logits = outputs.end_logits[0].cpu()
-        
-        start_idx = torch.argmax(start_logits).item()
-        end_idx = torch.argmax(end_logits).item()
-        
-        # Convert to character positions
-        if start_idx < len(offset_mapping) and end_idx < len(offset_mapping):
-            start_char = offset_mapping[start_idx][0].item()
-            end_char = offset_mapping[end_idx][1].item()
-            answer = context[start_char:end_char].strip()
-            return answer if answer else ""
-        
-        return ""
 
 
 def create_prompt(extractive_output: str, spoiler_type: str = None, style: str = "simple") -> str:
@@ -125,8 +72,10 @@ def generate_refinement_pairs(
         List of refinement pairs with input/output
     """
     # Load extractive model
-    extractive_model_path = config["extractive_model_path"]
-    predictor = ExtractivePredictor(extractive_model_path)
+    project_root = Path(__file__).parent.parent
+    model_path = project_root / "models" / "extractive_model" / "final_model"
+    #extractive_model_path = config["extractive_model_path"]
+    predictor = ExtractivePredictor(model_path)
     
     # Load data
     data_file = config[f"{split}_file"]
@@ -152,20 +101,28 @@ def generate_refinement_pairs(
         # Extract information
         post_text = " ".join(sample.get("postText", []))
         target_paragraphs = sample.get("targetParagraphs", [])
-        context = " ".join(target_paragraphs)
-        ground_truth = sample.get("spoiler", "")
+        context = " ".join(target_paragraphs) if isinstance(target_paragraphs, list) else target_paragraphs
+        
+        # Handle spoiler as list or string
+        spoiler = sample.get("spoiler", [])
+        if isinstance(spoiler, list):
+            ground_truth = " ".join(spoiler)
+        else:
+            ground_truth = spoiler
+        
         spoiler_type = sample.get("tags", ["unknown"])[0]
         
-        if not ground_truth.strip():
-            continue
+        # if not ground_truth.strip():
+        #     continue
         
         # Get extractive prediction
-        extractive_output = predictor.predict(post_text, context)
+        extractive_output = predictor.predict(question=post_text, context=context, top_k=1)
+        extractive_output = extractive_output[0]["answer"] if extractive_output else ""
         
-        if not extractive_output.strip():
-            # If extraction failed, use ground truth as input
-            # This teaches model to pass through good spoilers
-            extractive_output = ground_truth
+        # if not extractive_output.strip():
+        #     # If extraction failed, use ground truth as input
+        #     # This teaches model to pass through good spoilers
+        #     extractive_output = ground_truth
         
         # Create prompt
         input_text = create_prompt(extractive_output, spoiler_type, prompt_style)

@@ -1,2 +1,4 @@
 models/
-results
+results/
+data/
+src/__pycache__/

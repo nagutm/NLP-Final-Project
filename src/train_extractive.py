@@ -24,6 +24,7 @@ from transformers import (
     TrainingArguments,
     get_linear_schedule_with_warmup,
 )
+from datasets import Dataset, load_dataset
 
 # Configure logging
 logging.basicConfig(
@@ -225,42 +226,11 @@ def prepare_validation_features(examples: Dict, tokenizer, config: dict) -> Dict
     return tokenized_examples
 
 
-def train_extractive_model(config_path: str = "configs/extractive_config.yaml"):
-    """Main training function."""
-    
-    # Check CUDA availability and configuration
-    cuda_available = torch.cuda.is_available()
-    device_count = torch.cuda.device_count()
-    
-    logger.info("=" * 60)
-    logger.info("CUDA/Device Information")
-    logger.info("=" * 60)
-    logger.info(f"CUDA Available: {cuda_available}")
-    logger.info(f"CUDA Version: {torch.version.cuda}")
-    logger.info(f"GPU Device Count: {device_count}")
-    
-    if cuda_available:
-        for i in range(device_count):
-            props = torch.cuda.get_device_properties(i)
-            logger.info(f"GPU {i}: {props.name}")
-            logger.info(f"  Memory: {props.total_memory / 1e9:.2f} GB")
-    else:
-        logger.warning("CUDA is not available. Training will use CPU.")
-        logger.info("To enable CUDA, reinstall PyTorch with CUDA support:")
-        logger.info("  pip install torch --index-url https://download.pytorch.org/whl/cu118")
-    
-    logger.info("=" * 60)
-    
-    # Load configuration
-    config = load_config(config_path)
-    logger.info(f"Configuration loaded from {config_path}")
-    
-    # Create directories
+
+def train_single_model(config: dict):
     os.makedirs(config["output_dir"], exist_ok=True)
-    os.makedirs(config["checkpoint_dir"], exist_ok=True)
     os.makedirs(config["log_dir"], exist_ok=True)
-    
-    # Load model and tokenizer
+
     logger.info(f"Loading model: {config['model_name']}")
     try:
         tokenizer = AutoTokenizer.from_pretrained(config["model_name"])
@@ -271,39 +241,39 @@ def train_extractive_model(config_path: str = "configs/extractive_config.yaml"):
         tokenizer = AutoTokenizer.from_pretrained(config["model_name"], trust_remote_code=True)
         model = AutoModelForQuestionAnswering.from_pretrained(config["model_name"], trust_remote_code=True)
     
-    # Load data
+     # ----- Stage 1: optional SQuAD pre-finetune -----
+    '''use_squad = config.get("use_squad_pre_finetune", False)
+    squad_output_dir = config.get("squad_output_dir", os.path.join(config["output_dir"], "squad_stage"))
+
+    if use_squad:
+        if os.path.isdir(squad_output_dir) and os.listdir(squad_output_dir):
+            logger.info(f"Found existing SQuAD checkpoint at {squad_output_dir}, loading...")
+            tokenizer = AutoTokenizer.from_pretrained(squad_output_dir)
+            model = AutoModelForQuestionAnswering.from_pretrained(squad_output_dir)
+        else:
+            tokenizer, model = train_on_squad(config, tokenizer, model, squad_output_dir)
+    else:
+        logger.info("Skipping SQuAD pre-finetune stage for this model.")'''
+
+     # ----- Stage 2: clickbait fine-tune -----
+    script_dir = os.path.dirname(os.path.abspath(__file__))
     data_dir = config["data_dir"]
+
+    if not os.path.isabs(data_dir):
+        data_dir = os.path.join(script_dir, data_dir)
+
     train_file = os.path.join(data_dir, config["train_file"])
     val_file = os.path.join(data_dir, config["validation_file"])
-    
+
+    logger.info(f"Resolved data_dir: {data_dir}")
     logger.info(f"Loading training data from {train_file}")
     train_data = load_jsonl(train_file)
     train_examples, train_features = create_qa_examples(train_data, "train")
-    
+
     logger.info(f"Loading validation data from {val_file}")
     val_data = load_jsonl(val_file)
     val_examples, val_features = create_qa_examples(val_data, "validation")
 
-    # Subsample datasets if configured (e.g., 0.05 for 5%)
-    dataset_fraction = config.get("dataset_fraction", 1.0)
-    if 0.0 < dataset_fraction < 1.0:
-        seed = config.get("seed", 42)
-        random.seed(seed)
-
-        n_train = max(1, int(len(train_examples) * dataset_fraction))
-        n_val = max(1, int(len(val_examples) * dataset_fraction))
-
-        logger.info(
-            f"Subsampling datasets to {dataset_fraction*100:.2f}% -> {n_train} train, {n_val} val"
-        )
-
-        # If dataset is small enough that sample would be the same size, skip
-        if n_train < len(train_examples):
-            train_examples = random.sample(train_examples, n_train)
-        if n_val < len(val_examples):
-            val_examples = random.sample(val_examples, n_val)
-    
-    # Convert to HuggingFace Dataset
     train_dataset = Dataset.from_dict({
         "question": [ex["question"] for ex in train_examples],
         "context": [ex["context"] for ex in train_examples],
@@ -311,7 +281,7 @@ def train_extractive_model(config_path: str = "configs/extractive_config.yaml"):
         "answer_start": [ex["answer_start"] for ex in train_examples],
         "id": [ex["id"] for ex in train_examples],
     })
-    
+
     val_dataset = Dataset.from_dict({
         "question": [ex["question"] for ex in val_examples],
         "context": [ex["context"] for ex in val_examples],
@@ -319,11 +289,10 @@ def train_extractive_model(config_path: str = "configs/extractive_config.yaml"):
         "answer_start": [ex["answer_start"] for ex in val_examples],
         "id": [ex["id"] for ex in val_examples],
     })
-    
+
     logger.info(f"Training set size: {len(train_dataset)}")
     logger.info(f"Validation set size: {len(val_dataset)}")
-    
-    # Prepare features
+
     logger.info("Preparing training features...")
     train_dataset = train_dataset.map(
         lambda x: prepare_train_features(x, tokenizer, config),
@@ -331,7 +300,7 @@ def train_extractive_model(config_path: str = "configs/extractive_config.yaml"):
         remove_columns=train_dataset.column_names,
         batch_size=1000,
     )
-    
+
     logger.info("Preparing validation features...")
     val_dataset = val_dataset.map(
         lambda x: prepare_validation_features(x, tokenizer, config),
@@ -339,15 +308,15 @@ def train_extractive_model(config_path: str = "configs/extractive_config.yaml"):
         remove_columns=val_dataset.column_names,
         batch_size=1000,
     )
-    
-    # Determine device and mixed precision settings
+
+    cuda_available = torch.cuda.is_available()
+    device_count = torch.cuda.device_count()
     use_cuda = cuda_available and device_count > 0
-    use_fp16 = use_cuda  # Only use FP16 if CUDA is available
-    
+    use_fp16 = use_cuda
+
     logger.info(f"Training will use: {'CUDA' if use_cuda else 'CPU'}")
     logger.info(f"Mixed Precision (FP16): {use_fp16}")
-    
-    # Set up training arguments
+
     training_args = TrainingArguments(
         output_dir=config["output_dir"],
         eval_strategy="epoch",
@@ -360,13 +329,16 @@ def train_extractive_model(config_path: str = "configs/extractive_config.yaml"):
         logging_dir=config["log_dir"],
         logging_steps=100,
         save_strategy="epoch",
-        load_best_model_at_end=False,
         seed=42,
         fp16=use_fp16,
         no_cuda=not use_cuda,
+        optim="adamw_torch_fused",      # great on RTX 4060
+        dataloader_num_workers=4,       # try 2 if 4 is problematic on Windows
+        dataloader_pin_memory=True,
+        gradient_accumulation_steps=config.get("gradient_accumulation_steps", 1),
+        report_to="none",  
     )
-    
-    # Create trainer
+
     trainer = Trainer(
         model=model,
         args=training_args,
@@ -375,18 +347,70 @@ def train_extractive_model(config_path: str = "configs/extractive_config.yaml"):
         tokenizer=tokenizer,
         data_collator=DataCollatorWithPadding(tokenizer),
     )
-    
-    # Train
+
     logger.info("Starting training...")
     trainer.train()
-    
-    # Save final model
+
     model_save_path = os.path.join(config["output_dir"], "final_model")
     model.save_pretrained(model_save_path)
     tokenizer.save_pretrained(model_save_path)
     logger.info(f"Model saved to {model_save_path}")
-    
+
     return model, tokenizer
+
+def train_extractive_model(config_path: str = "configs/extractive_config.yaml"):
+    cuda_available = torch.cuda.is_available()
+    device_count = torch.cuda.device_count()
+
+    logger.info("=" * 60)
+    logger.info("CUDA/Device Information")
+    logger.info("=" * 60)
+    logger.info(f"CUDA Available: {cuda_available}")
+    logger.info(f"CUDA Version: {torch.version.cuda}")
+    logger.info(f"GPU Device Count: {device_count}")
+
+    if cuda_available:
+        for i in range(device_count):
+            props = torch.cuda.get_device_properties(i)
+            logger.info(f"GPU {i}: {props.name}")
+            logger.info(f"  Memory: {props.total_memory / 1e9:.2f} GB")
+    else:
+        logger.warning("CUDA is not available. Training will use CPU.")
+        logger.info("To enable CUDA, reinstall PyTorch with CUDA support:")
+        logger.info("  pip install torch --index-url https://download.pytorch.org/whl/cu118")
+
+    logger.info("=" * 60)
+
+    base_config = load_config(config_path)
+    logger.info(f"Configuration loaded from {config_path}")
+
+    model_list = base_config.get("models", None)
+
+    if model_list is None:
+        logger.info("No `models` list found in config → training single model.")
+        return train_single_model(base_config)
+
+    logger.info(f"Found {len(model_list)} model configs under `models:` key.")
+    shared_config = {k: v for k, v in base_config.items() if k != "models"}
+
+    results = {}
+
+    for m_cfg in model_list:
+        cfg = shared_config.copy()
+        cfg.update(m_cfg)
+
+        model_id = m_cfg.get("id", cfg.get("model_name", "unknown_model"))
+
+        logger.info("")
+        logger.info("#" * 80)
+        logger.info(f"Starting training for model: {model_id}")
+        logger.info("#" * 80)
+
+        model, tokenizer = train_single_model(cfg)
+        results[model_id] = (model, tokenizer)
+
+    return results
+
 
 
 if __name__ == "__main__":

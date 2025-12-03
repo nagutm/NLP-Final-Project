@@ -1,0 +1,10 @@
+{
+  "model": "deepset/roberta-base-squad2",
+  "model_safe": "deepset_roberta-base-squad2",
+  "num_examples": 335,
+  "bleu_mean": 0.18259168680595336,
+  "bleu_median": 0.17216896116316355,
+  "bleu_std": 0.21216955388454448,
+  "bleu_min": 0.0,
+  "bleu_max": 1.0
+}

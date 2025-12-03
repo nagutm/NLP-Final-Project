@@ -1,0 +1,10 @@
+{
+  "model": "bert-large-uncased-whole-word-masking-finetuned-squad",
+  "model_safe": "bert-large-uncased-whole-word-masking-finetuned-squad",
+  "num_examples": 335,
+  "bleu_mean": 0.2029762845025889,
+  "bleu_median": 0.1778279410038923,
+  "bleu_std": 0.22515014682951248,
+  "bleu_min": 0.0,
+  "bleu_max": 1.0
+}

@@ -1,7 +1,6 @@
 # Refinement Model Configuration
 # Fine-tunes FLAN-T5 to refine extractive spoiler predictions
 
-# Model settings
 model_name: "google/flan-t5-base"  # 250M parameters
 max_input_length: 512              # Max tokens for input (extractive output)
 max_output_length: 128             # Max tokens for refined output

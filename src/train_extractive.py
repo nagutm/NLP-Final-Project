@@ -1,421 +1,432 @@
-"""
-Extractive Model Training Script
-Trains DeBERTa-v3-base for clickbait spoiler span extraction using question-answering approach.
-"""
-
+import pandas as pd
 import json
-import logging
-import os
-import sys
-from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
-
-import numpy as np
-import random
+from transformers import AutoTokenizer, AutoModelForQuestionAnswering
 import torch
-import yaml
-from datasets import Dataset
 from torch.utils.data import DataLoader
-from transformers import (
-    AutoModelForQuestionAnswering,
-    AutoTokenizer,
-    DataCollatorWithPadding,
-    Trainer,
-    TrainingArguments,
-    get_linear_schedule_with_warmup,
+from torch.optim import AdamW
+from datasets import Dataset
+from collections import defaultdict
+import numpy as np
+from torch.utils.data import DataLoader
+from evaluate import load
+from transformers import default_data_collator
+from tqdm.auto import tqdm
+from accelerate import Accelerator
+from transformers import get_scheduler
+import os
+import yaml
+
+'''config = dict(
+    epochs=5,
+    classes=3,
+    batch_size=4,
+    learning_rate=1e-5,
+    model="roberta-base")'''
+
+default_config = dict(
+    # modeling / tokenization
+    model_name="deepset/roberta-base-squad2",
+    max_length=512,
+    stride=128,
+    n_best=25,
+    max_answer_length=30,
+
+    # training hyperparams
+    batch_size=8,
+    eval_batch_size=8,
+    epochs=10,
+    learning_rate=1e-6,
+
+    # dataset / filtering
+    spoiler_type="phrase",
+
+    # misc
+    save_dir="./models_task2",
+    mixed_precision="fp16",
 )
-from datasets import Dataset, load_dataset
 
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-)
-logger = logging.getLogger(__name__)
+config_path = "./configs/extractive_config.yaml"
 
-
-def load_config(config_path: str) -> dict:
-    """Load configuration from YAML file."""
-    with open(config_path, "r") as f:
-        config = yaml.safe_load(f)
-    
-    # Ensure numeric values are properly typed
-    numeric_keys = [
-        "max_seq_length",
-        "batch_size",
-        "eval_batch_size",
-        "num_epochs",
-        "learning_rate",
-        "warmup_steps",
-        "weight_decay",
-        "gradient_accumulation_steps",
-        "dataset_fraction",
-        "max_span_length",
-        "confidence_threshold",
-    ]
-    
-    for key in numeric_keys:
-        if key in config:
-            if key in ["learning_rate", "weight_decay", "confidence_threshold"]:
-                config[key] = float(config[key])
-            else:
-                # dataset_fraction should be treated as float not int
-                if key == "dataset_fraction":
-                    config[key] = float(config[key])
-                else:
-                    config[key] = int(config[key])
-    
-    return config
-
-
-def load_jsonl(file_path: str) -> List[Dict]:
-    """Load JSONL file."""
-    data = []
-    with open(file_path, "r", encoding="utf-8") as f:
-        for line in f:
-            if line.strip():
-                data.append(json.loads(line))
-    return data
-
-
-def create_qa_examples(data: List[Dict], dataset_type: str = "train") -> Tuple[List[Dict], List[Dict]]:
-    """
-    Convert clickbait spoiler dataset to QA format.
-    
-    Args:
-        data: List of sample dictionaries from JSONL
-        dataset_type: 'train' or 'validation'
-    
-    Returns:
-        Tuple of (examples, features) where examples are QA-style and features track metadata
-    """
-    examples = []
-    features = []
-    
-    for sample in data:
-        # Extract necessary information
-        post_text = " ".join(sample.get("postText", []))
-        target_paragraphs = sample.get("targetParagraphs", [])
-        spoiler_text = sample.get("spoiler", [])
-        spoiler_positions = sample.get("spoilerPositions", [])
-        tags = sample.get("tags", [])
-        
-        if not target_paragraphs or not spoiler_text:
-            continue
-        
-        # Concatenate all target paragraphs to form the context
-        context = " ".join(target_paragraphs)
-        
-        # Use post text as the question
-        question = post_text
-        
-        # Process each spoiler position
-        for spoiler_idx, spoiler_pos_list in enumerate(spoiler_positions):
-            for para_idx, char_pos in enumerate(spoiler_pos_list):
-                start_char, end_char = char_pos
-                
-                # Get the actual spoiler text at this position
-                if para_idx < len(target_paragraphs):
-                    paragraph = target_paragraphs[para_idx]
-                    actual_spoiler = paragraph[start_char:end_char]
-                    
-                    # Calculate offset in concatenated context
-                    context_offset = sum(
-                        len(target_paragraphs[i]) + 1 for i in range(para_idx)  # +1 for space
-                    )
-                    
-                    example = {
-                        "question": question,
-                        "context": context,
-                        "answer_text": actual_spoiler,
-                        "answer_start": context_offset + start_char,
-                        "id": f"{sample.get('uuid', '')}__{spoiler_idx}_{para_idx}",
-                    }
-                    
-                    examples.append(example)
-                    features.append({
-                        "id": sample.get("uuid", ""),
-                        "tags": tags,
-                        "platform": sample.get("postPlatform", ""),
-                    })
-    
-    logger.info(f"Created {len(examples)} examples from {len(data)} samples")
-    return examples, features
-
-
-def prepare_train_features(examples: Dict, tokenizer, config: dict) -> Dict:
-    """Prepare features for training."""
-    max_seq_length = config.get("max_seq_length", 512)
-    doc_stride = 128
-    
-    # Tokenize contexts and questions
-    tokenized_examples = tokenizer(
-        examples["question"],
-        examples["context"],
-        truncation="only_second",
-        max_length=max_seq_length,
-        stride=doc_stride,
-        return_overflowing_tokens=True,
-        return_offsets_mapping=True,
-        padding="max_length",
-    )
-    
-    # Get offset mapping
-    sample_mapping = tokenized_examples.pop("overflow_to_sample_mapping")
-    offset_mapping = tokenized_examples.pop("offset_mapping")
-    
-    # Initialize start and end labels
-    tokenized_examples["start_positions"] = []
-    tokenized_examples["end_positions"] = []
-    
-    for i, offsets in enumerate(offset_mapping):
-        sample_idx = sample_mapping[i]
-        answers = examples["answer_start"][sample_idx]
-        answer_text = examples["answer_text"][sample_idx]
-        
-        # If no answer, set positions to (0, 0)
-        if answers == -1:
-            tokenized_examples["start_positions"].append(0)
-            tokenized_examples["end_positions"].append(0)
-            continue
-        
-        start_char = answers
-        end_char = start_char + len(answer_text)
-        
-        # Find token positions
-        token_start_index = 0
-        token_end_index = len(offsets) - 1
-        
-        for j, (offset_start, offset_end) in enumerate(offsets):
-            if offset_start <= start_char < offset_end:
-                token_start_index = j
-            if offset_start < end_char <= offset_end:
-                token_end_index = j
-                break
-        
-        tokenized_examples["start_positions"].append(token_start_index)
-        tokenized_examples["end_positions"].append(token_end_index)
-    
-    return tokenized_examples
-
-
-def prepare_validation_features(examples: Dict, tokenizer, config: dict) -> Dict:
-    """Prepare features for validation."""
-    max_seq_length = config.get("max_seq_length", 512)
-    doc_stride = 128
-    
-    tokenized_examples = tokenizer(
-        examples["question"],
-        examples["context"],
-        truncation="only_second",
-        max_length=max_seq_length,
-        stride=doc_stride,
-        return_overflowing_tokens=True,
-        return_offsets_mapping=True,
-        padding="max_length",
-    )
-    
-    # Store mapping info for post-processing
-    sample_mapping = tokenized_examples.pop("overflow_to_sample_mapping")
-    tokenized_examples["example_id"] = []
-    
-    for i in range(len(tokenized_examples["input_ids"])):
-        sample_idx = sample_mapping[i]
-        tokenized_examples["example_id"].append(examples["id"][sample_idx])
-    
-    return tokenized_examples
-
-
-
-def train_single_model(config: dict):
-    os.makedirs(config["output_dir"], exist_ok=True)
-    os.makedirs(config["log_dir"], exist_ok=True)
-
-    logger.info(f"Loading model: {config['model_name']}")
+if os.path.exists(config_path):
     try:
-        tokenizer = AutoTokenizer.from_pretrained(config["model_name"])
-        model = AutoModelForQuestionAnswering.from_pretrained(config["model_name"])
+        with open(config_path, "r") as fh:
+            user_cfg = yaml.safe_load(fh) or {}
+        # merge: user keys override defaults
+        config = {**default_config, **user_cfg}
+        config["learning_rate"] = float(config["learning_rate"])
+        config["max_length"] = int(config["max_length"])
+        config["stride"] = int(config["stride"])
+        config["n_best"] = int(config["n_best"])
+        config["max_answer_length"] = int(config["max_answer_length"])
+        config["batch_size"] = int(config["batch_size"])
+        config["eval_batch_size"] = int(config["eval_batch_size"])
+        config["epochs"] = int(config["epochs"])
+        print(f"[config] Loaded config from {config_path}")
     except Exception as e:
-        logger.error(f"Error loading model: {e}")
-        logger.info("Attempting with trust_remote_code=True...")
-        tokenizer = AutoTokenizer.from_pretrained(config["model_name"], trust_remote_code=True)
-        model = AutoModelForQuestionAnswering.from_pretrained(config["model_name"], trust_remote_code=True)
-    
-     # ----- Stage 1: optional SQuAD pre-finetune -----
-    '''use_squad = config.get("use_squad_pre_finetune", False)
-    squad_output_dir = config.get("squad_output_dir", os.path.join(config["output_dir"], "squad_stage"))
+        print(f"[config] Failed to load {config_path}: {e}. Using defaults.")
+        config = default_config
+else:
+    print(f"[config] No {config_path} found. Using default config.")
+    config = default_config
 
-    if use_squad:
-        if os.path.isdir(squad_output_dir) and os.listdir(squad_output_dir):
-            logger.info(f"Found existing SQuAD checkpoint at {squad_output_dir}, loading...")
-            tokenizer = AutoTokenizer.from_pretrained(squad_output_dir)
-            model = AutoModelForQuestionAnswering.from_pretrained(squad_output_dir)
+if "models" in config:
+    model_list = config["models"]
+else:
+    model_list = [config["model_name"]]
+
+def convert2squadFormat(df):
+    df_fin = df[['uuid','targetTitle','postText',"mergedParas","tokPos","spoiler"]]
+    # Create answer field, skipping rows where tokPos is empty
+    def get_answer(x):
+        if len(x['tokPos']) > 0:
+            return {'text': x['spoiler'], "answer_start": [x['tokPos'][0][0]]}
         else:
-            tokenizer, model = train_on_squad(config, tokenizer, model, squad_output_dir)
-    else:
-        logger.info("Skipping SQuAD pre-finetune stage for this model.")'''
-
-     # ----- Stage 2: clickbait fine-tune -----
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    data_dir = config["data_dir"]
-
-    if not os.path.isabs(data_dir):
-        data_dir = os.path.join(script_dir, data_dir)
-
-    train_file = os.path.join(data_dir, config["train_file"])
-    val_file = os.path.join(data_dir, config["validation_file"])
-
-    logger.info(f"Resolved data_dir: {data_dir}")
-    logger.info(f"Loading training data from {train_file}")
-    train_data = load_jsonl(train_file)
-    train_examples, train_features = create_qa_examples(train_data, "train")
-
-    logger.info(f"Loading validation data from {val_file}")
-    val_data = load_jsonl(val_file)
-    val_examples, val_features = create_qa_examples(val_data, "validation")
-
-    train_dataset = Dataset.from_dict({
-        "question": [ex["question"] for ex in train_examples],
-        "context": [ex["context"] for ex in train_examples],
-        "answer_text": [ex["answer_text"] for ex in train_examples],
-        "answer_start": [ex["answer_start"] for ex in train_examples],
-        "id": [ex["id"] for ex in train_examples],
-    })
-
-    val_dataset = Dataset.from_dict({
-        "question": [ex["question"] for ex in val_examples],
-        "context": [ex["context"] for ex in val_examples],
-        "answer_text": [ex["answer_text"] for ex in val_examples],
-        "answer_start": [ex["answer_start"] for ex in val_examples],
-        "id": [ex["id"] for ex in val_examples],
-    })
-
-    logger.info(f"Training set size: {len(train_dataset)}")
-    logger.info(f"Validation set size: {len(val_dataset)}")
-
-    logger.info("Preparing training features...")
-    train_dataset = train_dataset.map(
-        lambda x: prepare_train_features(x, tokenizer, config),
-        batched=True,
-        remove_columns=train_dataset.column_names,
-        batch_size=1000,
-    )
-
-    logger.info("Preparing validation features...")
-    val_dataset = val_dataset.map(
-        lambda x: prepare_validation_features(x, tokenizer, config),
-        batched=True,
-        remove_columns=val_dataset.column_names,
-        batch_size=1000,
-    )
-
-    cuda_available = torch.cuda.is_available()
-    device_count = torch.cuda.device_count()
-    use_cuda = cuda_available and device_count > 0
-    use_fp16 = use_cuda
-
-    logger.info(f"Training will use: {'CUDA' if use_cuda else 'CPU'}")
-    logger.info(f"Mixed Precision (FP16): {use_fp16}")
-
-    training_args = TrainingArguments(
-        output_dir=config["output_dir"],
-        eval_strategy="epoch",
-        learning_rate=config["learning_rate"],
-        per_device_train_batch_size=config["batch_size"],
-        per_device_eval_batch_size=config["eval_batch_size"],
-        num_train_epochs=config["num_epochs"],
-        weight_decay=config["weight_decay"],
-        warmup_steps=config["warmup_steps"],
-        logging_dir=config["log_dir"],
-        logging_steps=100,
-        save_strategy="epoch",
-        seed=42,
-        fp16=use_fp16,
-        no_cuda=not use_cuda,
-        optim="adamw_torch_fused",      # great on RTX 4060
-        dataloader_num_workers=4,       # try 2 if 4 is problematic on Windows
-        dataloader_pin_memory=True,
-        gradient_accumulation_steps=config.get("gradient_accumulation_steps", 1),
-        report_to="none",  
-    )
-
-    trainer = Trainer(
-        model=model,
-        args=training_args,
-        train_dataset=train_dataset,
-        eval_dataset=val_dataset,
-        tokenizer=tokenizer,
-        data_collator=DataCollatorWithPadding(tokenizer),
-    )
-
-    logger.info("Starting training...")
-    trainer.train()
-
-    model_save_path = os.path.join(config["output_dir"], "final_model")
-    model.save_pretrained(model_save_path)
-    tokenizer.save_pretrained(model_save_path)
-    logger.info(f"Model saved to {model_save_path}")
-
-    return model, tokenizer
-
-def train_extractive_model(config_path: str = "configs/extractive_config.yaml"):
-    cuda_available = torch.cuda.is_available()
-    device_count = torch.cuda.device_count()
-
-    logger.info("=" * 60)
-    logger.info("CUDA/Device Information")
-    logger.info("=" * 60)
-    logger.info(f"CUDA Available: {cuda_available}")
-    logger.info(f"CUDA Version: {torch.version.cuda}")
-    logger.info(f"GPU Device Count: {device_count}")
-
-    if cuda_available:
-        for i in range(device_count):
-            props = torch.cuda.get_device_properties(i)
-            logger.info(f"GPU {i}: {props.name}")
-            logger.info(f"  Memory: {props.total_memory / 1e9:.2f} GB")
-    else:
-        logger.warning("CUDA is not available. Training will use CPU.")
-        logger.info("To enable CUDA, reinstall PyTorch with CUDA support:")
-        logger.info("  pip install torch --index-url https://download.pytorch.org/whl/cu118")
-
-    logger.info("=" * 60)
-
-    base_config = load_config(config_path)
-    logger.info(f"Configuration loaded from {config_path}")
-
-    model_list = base_config.get("models", None)
-
-    if model_list is None:
-        logger.info("No `models` list found in config → training single model.")
-        return train_single_model(base_config)
-
-    logger.info(f"Found {len(model_list)} model configs under `models:` key.")
-    shared_config = {k: v for k, v in base_config.items() if k != "models"}
-
-    results = {}
-
-    for m_cfg in model_list:
-        cfg = shared_config.copy()
-        cfg.update(m_cfg)
-
-        model_id = m_cfg.get("id", cfg.get("model_name", "unknown_model"))
-
-        logger.info("")
-        logger.info("#" * 80)
-        logger.info(f"Starting training for model: {model_id}")
-        logger.info("#" * 80)
-
-        model, tokenizer = train_single_model(cfg)
-        results[model_id] = (model, tokenizer)
-
-    return results
-
-
-
-if __name__ == "__main__":
-    config_path = "configs/extractive_config.yaml"
-    if len(sys.argv) > 1:
-        config_path = sys.argv[1]
+            return {'text': x['spoiler'], "answer_start": [0]}
     
-    train_extractive_model(config_path)
+    df_fin["asnwers"] = df_fin.apply(get_answer, axis=1)
+    df_fin = df_fin.drop(columns=["tokPos","spoiler"])
+    df_fin.columns = ["id","title","question","context","answers"]
+    
+    return df_fin
+
+def preprocess_training_examples(examples):
+    questions = examples['question']
+    inputs = tokenizer(
+        questions,
+        examples["context"],
+        max_length=max_length,
+        truncation="only_second",
+        stride=stride,
+        return_overflowing_tokens=True,
+        return_offsets_mapping=True,
+        padding="max_length",
+    )
+
+    offset_mapping = inputs.pop("offset_mapping")
+    sample_map = inputs.pop("overflow_to_sample_mapping")
+    answers = examples["answers"]
+    start_positions = []
+    end_positions = []
+
+    for i, offset in enumerate(offset_mapping):
+        sample_idx = sample_map[i]
+        answer = answers[sample_idx]
+        start_char = answer["answer_start"][0]
+        end_char = answer["answer_start"][0] + len(answer["text"][0])
+        sequence_ids = inputs.sequence_ids(i)
+
+        # Find the start and end of the context
+        idx = 0
+        while sequence_ids[idx] != 1:
+            idx += 1
+        context_start = idx
+        while sequence_ids[idx] == 1:
+            idx += 1
+        context_end = idx - 1
+
+        # If the answer is not fully inside the context, label is (0, 0)
+        if offset[context_start][0] > start_char or offset[context_end][1] < end_char:
+            start_positions.append(0)
+            end_positions.append(0)
+        else:
+            # Otherwise it's the start and end token positions
+            idx = context_start
+            while idx <= context_end and offset[idx][0] <= start_char:
+                idx += 1
+            start_positions.append(idx - 1)
+
+            idx = context_end
+            while idx >= context_start and offset[idx][1] >= end_char:
+                idx -= 1
+            end_positions.append(idx + 1)
+
+    inputs["start_positions"] = start_positions
+    inputs["end_positions"] = end_positions
+    return inputs
+
+def preprocess_validation_examples(examples):
+    questions = examples["question"]
+    inputs = tokenizer(
+        questions,
+        examples["context"],
+        max_length=max_length,
+        truncation="only_second",
+        stride=stride,
+        return_overflowing_tokens=True,
+        return_offsets_mapping=True,
+        padding="max_length",
+    )
+
+    sample_map = inputs.pop("overflow_to_sample_mapping")
+    example_ids = []
+
+    for i in range(len(inputs["input_ids"])):
+        sample_idx = sample_map[i]
+        example_ids.append(examples["id"][sample_idx])
+
+        sequence_ids = inputs.sequence_ids(i)
+        offset = inputs["offset_mapping"][i]
+        inputs["offset_mapping"][i] = [
+            o if sequence_ids[k] == 1 else None for k, o in enumerate(offset)
+        ]
+
+    inputs["example_id"] = example_ids
+    return inputs
+
+def compute_metrics(start_logits, end_logits, features, examples, predictOnly=False):
+    example_to_features = defaultdict(list)
+    for idx, feature in enumerate(features):
+        example_to_features[feature["example_id"]].append(idx)
+
+    predicted_spoilers = []
+    for example in tqdm(examples):
+        example_id = example["id"]
+        context = example["context"]
+        spoilers = []
+
+        # Loop through all features associated with that example
+        for feature_index in example_to_features[example_id]:
+            start_logit = start_logits[feature_index]
+            end_logit = end_logits[feature_index]
+            offsets = features[feature_index]["offset_mapping"]
+
+            start_indexes = np.argsort(start_logit)[-1 : -n_best - 1 : -1].tolist()
+            end_indexes = np.argsort(end_logit)[-1 : -n_best - 1 : -1].tolist()
+            for start_index in start_indexes:
+                for end_index in end_indexes:
+                    # Skip answers that are not fully in the context
+                    if offsets[start_index] is None or offsets[end_index] is None:
+                        continue
+                    # Skip answers with a length that is either < 0 or > max_answer_length
+                    if (
+                        end_index < start_index
+                        or end_index - start_index + 1 > max_answer_length
+                    ):
+                        continue
+
+                    answer = {
+                        "text": context[offsets[start_index][0] : offsets[end_index][1]],
+                        "logit_score": start_logit[start_index] + end_logit[end_index],
+                    }
+                    spoilers.append(answer)
+
+        # Select the answer with the best score
+        if len(spoilers) > 0:
+            best_answer = max(spoilers, key=lambda x: x["logit_score"])
+            predicted_spoilers.append(
+                {"id": example_id, "prediction_text": best_answer["text"]}
+            )
+        else:
+            predicted_spoilers.append({"id": example_id, "prediction_text": ""})
+            
+    predicted_texts = [i['prediction_text'] for i in predicted_spoilers]
+    
+    if predictOnly:
+        return predicted_texts
+    
+    actual_spoilers_squad = [{"id": ex["id"], "answers": ex["answers"]} for ex in examples]
+    actual_spoilers = [i['answers']['text'][0] for i in actual_spoilers_squad]    
+    
+    squad_metrics_eval = squad_metric.compute(predictions=predicted_spoilers, references=actual_spoilers_squad)
+    bleu_eval = bleu.compute(predictions=predicted_texts, references=actual_spoilers)
+    
+    return [squad_metrics_eval,bleu_eval],actual_spoilers,predicted_texts
+
+bleu = load("bleu")
+squad_metric = load("squad")
+
+errorUuid = {"ad9271b7-9983-42f5-9bd9-fdfcb171ddaa":[[[4, 37],[4, 222]]]}
+def parse_spoiler(x):
+    spoiler = []
+    if x['uuid'] in errorUuid:
+        x['spoilerPositions'] = errorUuid[x['uuid']]
+
+    for s in x['spoilerPositions']:
+        st,en = s[0],s[1]
+        spoiler.append(x['targetParagraphs'][st[0]][st[1]:en[1]])
+        
+    return spoiler
+
+def findPosTags(x):    
+    tokPos = []
+    for pos in x['spoilerPositions']:
+ 
+        # Auto-fix flat or malformed formats
+        if not isinstance(pos, (list, tuple)) or len(pos) != 2:
+            # try to convert [4,37] → [[4,37],[4,37]]
+            if isinstance(pos, (list, tuple)) and len(pos) == 2 and all(isinstance(i,int) for i in pos):
+                st = [pos[0], pos[0]]
+                en = [pos[1], pos[1]]
+            else:
+                continue
+        else:
+            st, en = pos
+ 
+        idx = 0
+        for i,p in enumerate([x['targetTitle']] + x['targetParagraphs']):
+            if i == st[0] + 1:
+                start_ind = idx + st[1]
+                end_ind = idx + en[1]
+                tokPos.append([start_ind, end_ind])
+                break
+ 
+            if i == 0:
+                idx += len(p) + 3
+            else:
+                idx += len(p) + 1
+       
+    return tokPos
+
+def read_prep(path,train=True):
+    with open(path, 'rb') as json_file:
+        json_list = list(json_file)
+
+    results = []
+    for json_str in json_list:
+        result = json.loads(json_str)
+        results.append(result)
+    df = pd.DataFrame(results)
+    df['tags'] = df.tags.apply(lambda x:x[0],1)
+    df['postText'] = df.postText.apply(lambda x:x[0],1)    
+    
+    # Parsing for faulty spoiler ids
+    df['spoilerParsed'] = df.apply(parse_spoiler,1)
+    df['mergedParas'] = df['targetParagraphs'].apply(lambda x:" ".join(x),1)
+    df.mergedParas = df.targetTitle + " - " + df.mergedParas
+    df['tokPos'] = df.apply(findPosTags,1)
+    df['label'] = df['tags'].map({"phrase":0,"passage":1,"multi":2})
+    
+    return df
+
+df_train = read_prep("./data/train.jsonl")
+df_valid = read_prep("./data/validation.jsonl")
+
+spoiler_type = config.get("spoiler_type", "multi")
+train_df = df_train[df_train.tags==spoiler_type]
+val_df = df_valid[df_valid.tags==spoiler_type]
+
+len(train_df),len(val_df)
+
+train_df = convert2squadFormat(train_df)
+val_df = convert2squadFormat(val_df)
+
+train_data = Dataset.from_pandas(train_df.reset_index(drop=True), split="train")
+val_data = Dataset.from_pandas(val_df.reset_index(drop=True), split="test")
+
+
+
+
+# Para Generation
+# config = dict(
+# max_length = 512,
+# stride = 128,
+# n_best = 15,
+# max_answer_length = 100,
+# batch_size = 8,
+# epochs = 20,
+# learning_rate = 1e-6,
+# model_name = model_name,
+# spoiler_type = "passage"
+# )
+
+# Phrase Generation
+
+
+
+for model_name in model_list:
+    print(f"Training model: {model_name}")
+    max_length = config["max_length"]
+    stride = config["stride"]
+    n_best = config["n_best"]
+    max_answer_length = config["max_answer_length"]
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    model = AutoModelForQuestionAnswering.from_pretrained(model_name)
+    train_dataset = train_data.map(
+    preprocess_training_examples,
+    batched=True,
+    remove_columns=train_data.column_names,
+)  
+    validation_dataset = val_data.map(
+    preprocess_validation_examples,
+    batched=True,
+    remove_columns=val_data.column_names,
+)
+    len(train_dataset), len(validation_dataset)
+    train_dataset.set_format("torch")
+    validation_set = validation_dataset.remove_columns(["example_id", "offset_mapping"])
+    validation_set.set_format("torch")
+    train_dataloader = DataLoader(
+    train_dataset,
+    shuffle=True,
+    collate_fn=default_data_collator,
+    batch_size=config["batch_size"],
+)
+    eval_dataloader = DataLoader(
+    validation_set, collate_fn=default_data_collator, batch_size=8 
+)
+    optimizer = AdamW(model.parameters(), lr=config["learning_rate"])
+    accelerator = Accelerator(mixed_precision="fp16")
+    model, optimizer, train_dataloader, eval_dataloader = accelerator.prepare(
+    model, optimizer, train_dataloader, eval_dataloader
+)
+    num_train_epochs = config["epochs"]
+    num_update_steps_per_epoch = len(train_dataloader)
+    num_training_steps = num_train_epochs * num_update_steps_per_epoch
+    lr_scheduler = get_scheduler(
+    "linear",
+    optimizer=optimizer,
+    num_warmup_steps=0,
+    num_training_steps=num_training_steps,
+)
+    progress_bar = tqdm(range(num_training_steps))
+    all_metrics = []
+    max_bleu = 0.2
+    save_dir = config.get("save_dir", "./models_task2")
+    for epoch in range(num_train_epochs):
+    # Training
+     model.train()
+     train_loss = 0
+     for step, batch in enumerate(train_dataloader):
+        outputs = model(**batch)
+        loss = outputs.loss
+        accelerator.backward(loss)
+        train_loss+=loss.item()
+        
+        optimizer.step()
+        lr_scheduler.step()
+        optimizer.zero_grad()
+        progress_bar.update(1)
+    
+
+    # Evaluation
+     model.eval()
+     start_logits = []
+     end_logits = []
+     accelerator.print("Evaluation!")
+    
+     for batch in tqdm(eval_dataloader):
+        with torch.no_grad():
+            outputs = model(**batch)
+
+        start_logits.append(accelerator.gather(outputs.start_logits).cpu().numpy())
+        end_logits.append(accelerator.gather(outputs.end_logits).cpu().numpy())
+
+     start_logits = np.concatenate(start_logits)
+     end_logits = np.concatenate(end_logits)
+     start_logits = start_logits[: len(validation_dataset)]
+     end_logits = end_logits[: len(validation_dataset)]
+
+     metrics,theoretical_texts,predicted_texts = compute_metrics(
+        start_logits, end_logits, validation_dataset, val_data
+    )
+     all_metrics.append(metrics)
+     bleu_score = metrics[1].get("bleu", 0.0)
+     if bleu_score > max_bleu:
+        model_save_path = os.path.join(save_dir, model_name.replace("/", "_"), f"{spoiler_type}")
+        os.makedirs(model_save_path, exist_ok=True)
+        model.save_pretrained(model_save_path)
+        tokenizer.save_pretrained(model_save_path)
+        max_bleu = bleu_score
+        print(f"[save] new best bleu {max_bleu:.4f} -> saved to {model_save_path}")
+     print(f"epoch {epoch}:", metrics)
+

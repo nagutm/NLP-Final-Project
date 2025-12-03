@@ -2,35 +2,21 @@
 # DeBERTa-v3-base for span extraction using question-answering approach
 
 # Model Configuration
-model_name: "microsoft/deberta-v3-base"
-max_seq_length: 512
 
-# Training Configuration
-batch_size: 16
-eval_batch_size: 32
-num_epochs: 3
-learning_rate: 2e-5
-warmup_steps: 500
-weight_decay: 0.01
-gradient_accumulation_steps: 1
+models:
+  - deepset/roberta-base-squad2
+  - deepset/deberta-v3-base-squad2
+  - bert-large-uncased-whole-word-masking-finetuned-squad
 
-# Data Configuration
-data_dir: "data/"
-train_file: "train.jsonl"
-validation_file: "validation.jsonl"
+max_length: 512
+stride: 128
+n_best: 25
+max_answer_length: 30
 
-# Output Configuration
-output_dir: "models/extractive_model"
-checkpoint_dir: "checkpoints/extractive"
-log_dir: "logs/extractive"
+batch_size: 8
+eval_batch_size: 8
+epochs: 3
+learning_rate: 1e-5
 
-# SQuAD Pretraining Configuration (optional)
-squad_pretrain: false
-squad_epochs: 1
-squad_dataset: "squad"
-
-# Inference Configuration
-max_span_length: 100
-confidence_threshold: 0.5
-# Fraction of dataset to use (0.0-1.0). Use 0.05 for 5%.
-dataset_fraction: 0.005
+spoiler_type: "phrase"
+save_dir: "./models_task2"

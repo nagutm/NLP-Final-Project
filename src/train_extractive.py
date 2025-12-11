@@ -296,7 +296,7 @@ def read_prep(path,train=True):
 df_train = read_prep("./data/train.jsonl")
 df_valid = read_prep("./data/validation.jsonl")
 
-spoiler_type = config.get("spoiler_type", "multi")
+spoiler_type = config.get("spoiler_type", "phrase")
 train_df = df_train[df_train.tags==spoiler_type]
 val_df = df_valid[df_valid.tags==spoiler_type]
 

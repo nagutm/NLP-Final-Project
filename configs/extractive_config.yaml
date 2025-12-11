@@ -17,5 +17,5 @@ eval_batch_size: 8
 epochs: 3
 learning_rate: 1e-5
 
-spoiler_type: "multi"
+spoiler_type: "phrase"
 save_dir: "./models_task2"

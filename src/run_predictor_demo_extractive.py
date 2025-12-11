@@ -6,13 +6,13 @@ import json
 import sys
 import logging
 from pathlib import Path
-from evaluate import load
 
 # Add parent directory to path to import src modules
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from extractive_predictor import ExtractivePredictor
 from utils import load_jsonl
+import evaluate
 import statistics
 import numpy as np
 
@@ -22,9 +22,21 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+bleu_metric = evaluate.load("bleu")
 
-bleu_metric = load("bleu")
-
+def _compute_bleu4(reference: str, candidate: str) -> float:
+    if not reference or not candidate:
+        return 0.0
+    try:
+        result = bleu_metric.compute(
+            predictions=[candidate],
+            references=[[reference]],
+            max_order=4,
+            smooth=True
+        )
+        return float(result["precisions"][3])
+    except Exception:
+        return 0.0
 
 def run_predictor_demo():
     project_root = Path(__file__).parent.parent
@@ -43,9 +55,7 @@ def run_predictor_demo():
 
     if not model_list:
         model_list = [
-            "deepset/deberta-v3-base-squad2", 
-            "deepset/roberta-base-squad2",
-            "bert-large-uncased-whole-word-masking-finetuned-squad"
+            "deepset/roberta-base-squad2"
         ]
 
     # Load validation data
@@ -56,14 +66,13 @@ def run_predictor_demo():
         return
     val_data = load_jsonl(str(val_data_path))
     num_samples = len(val_data)
+    TARGET_SPOILER_TYPE = "phrase"
 
-    # We'll save per-model results and a combined mapping
-    combined_results = {}
 
     for model_name in model_list:
         # create a filesystem-safe model name
         model_name_safe = model_name.replace("/", "_")
-        model_path = project_root / "models_task2" / model_name_safe / "phrase"
+        model_path = project_root / "models_task2" / model_name_safe / TARGET_SPOILER_TYPE
 
         logger.info("\n" + "=" * 80)
         logger.info(f"MODEL: {model_name} -> looking for checkpoint at: {model_path}")
@@ -84,13 +93,9 @@ def run_predictor_demo():
             import traceback
             traceback.print_exc()
             continue
-
-        logger.info(f"Running predictions for {model_name} on up to {num_samples} phrase samples...")
-        results = []
         processed = 0
-        all_predictions = []
-        all_references = []
-
+        bleu_vals = []
+        samples = []
         for i, example in enumerate(val_data):
             # Only process up to num_samples phrase examples
             if processed >= num_samples:
@@ -99,7 +104,7 @@ def run_predictor_demo():
             spoiler_type = example.get("tags", ["unknown"])
             if isinstance(spoiler_type, list):
                 spoiler_type = spoiler_type[0] if spoiler_type else "unknown"
-            if spoiler_type != "phrase":
+            if spoiler_type != TARGET_SPOILER_TYPE:
                 continue
 
             # Prepare input
@@ -121,51 +126,44 @@ def run_predictor_demo():
 
             # Build a compact result entry
             top_pred = preds[0]['answer'] if preds else ""
-            all_predictions.append(top_pred)
-            all_references.append(spoiler)
-            entry = {
-                "question": post,
-                "context_snippet": (article[:300] + "...") if len(article) > 300 else article,
-                "ground_truth": spoiler,
-                "predictions": [
-                    {
-                        "answer": p.get("answer", ""),
-                        "confidence": float(p.get("confidence", 0.0)),
-                    }
-                    for p in preds
-                ],
-                "top_prediction": top_pred,
-                "spoiler_type": spoiler_type
-            }
-            results.append(entry)
+            bleu4 = _compute_bleu4(spoiler, top_pred)
+            bleu_vals.append(bleu4)
             processed += 1
-            logger.info(f"[{model_name_safe}] sample {processed}/{num_samples} — top: '{top_pred}'")
-        if all_predictions and all_references:
-            bleu_result = bleu_metric.compute(predictions=all_predictions, references=all_references)
-            bleu4_score = bleu_result['precisions'][3]  # Index 3 = 4-gram precision
+            samples.append({
+                "question": post,
+                "prediction": top_pred,
+                "reference": spoiler,
+                "bleu": bleu4
+            })
+
+            logger.info(f"Sample {processed}/{num_samples} — BLEU: {bleu4:.4f}")
+        if bleu_vals:
+            mean_bleu = float(np.mean(bleu_vals))
+            logger.info(f"BLEU-4: {mean_bleu:.4f} over {len(bleu_vals)} examples")
         else:
-            bleu4_score = 0.0
-        
-        summary = {
+           logger.info("No examples processed.")
+        results = {
             "model": model_name,
-            "model_safe": model_name_safe,
-            "num_examples": len(all_predictions),
-            "bleu4": float(bleu4_score),
+            "spoiler_type": TARGET_SPOILER_TYPE,
+            "num_samples": len(bleu_vals),
+            "bleu_mean": mean_bleu,
+            "bleu_std": float(np.std(bleu_vals)) if bleu_vals else 0.0,
+            "bleu_min": float(min(bleu_vals)) if bleu_vals else 0.0,
+            "bleu_max": float(max(bleu_vals)) if bleu_vals else 0.0,
+            "samples": samples
         }
-        # Save per-model JSON
+
+        # Save to JSON
         out_dir = project_root / "results"
         out_dir.mkdir(parents=True, exist_ok=True)
-        per_model_path = out_dir / f"predictions_{model_name_safe}.json"
-        with per_model_path.open("w", encoding="utf-8") as f:
+        output_path = out_dir / f"predictions_{model_name_safe}_{TARGET_SPOILER_TYPE}.json"
+        
+        with open(output_path, "w", encoding="utf-8") as f:
             json.dump(results, f, indent=2, ensure_ascii=False)
-        logger.info(f"Saved {len(results)} results for {model_name} -> {per_model_path}")
+        
+        logger.info(f"Results saved to {output_path}")
 
-        summary_path = out_dir / f"summary_{model_name_safe}.json"
-        with summary_path.open("w", encoding="utf-8") as f:
-            json.dump(summary, f, indent=2, ensure_ascii=False)
-        logger.info(f"Saved summary for {model_name} -> {summary_path}")
-
-        logger.info(f"[{model_name_safe}] BLEU mean: {summary['bleu4']:.4f} | examples: {summary['num_examples']}")
+        
 
     logger.info("Demo complete.")
 

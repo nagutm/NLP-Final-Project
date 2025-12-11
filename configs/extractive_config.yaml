@@ -5,8 +5,7 @@
 
 models:
   - deepset/roberta-base-squad2
-  - deepset/deberta-v3-base-squad2
-  - bert-large-uncased-whole-word-masking-finetuned-squad
+  
 
 max_length: 512
 stride: 128
@@ -18,5 +17,5 @@ eval_batch_size: 8
 epochs: 3
 learning_rate: 1e-5
 
-spoiler_type: "phrase"
+spoiler_type: "multi"
 save_dir: "./models_task2"

@@ -9,13 +9,14 @@ import torch
 from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
 from evaluate import load
 from tqdm import tqdm
+import numpy as np
 
 # Configuration
 config = dict(
     max_input_length=512,
     max_target_length=128,
     batch_size=8,
-    spoiler_type="phrase",
+    spoiler_type="phrase",  # Options: "passage", "title", "post"
     model_path="./models_refinement_phrase/",  # Path to your trained model
 )
 
@@ -135,10 +136,28 @@ def evaluate_refinement_model():
     print("\nComputing metrics...")
     
     # BLEU-4
-    bleu_result = bleu_metric.compute(predictions=all_predictions, references=all_references)
-    bleu4_score = bleu_result['precisions'][3]
-    
-    # BERTScore
+    '''bleu_result = bleu_metric.compute(predictions=all_predictions, references=all_references)
+    bleu4_score = bleu_result['precisions'][3]'''
+    def compute_sentence_bleu(reference: str, prediction: str) -> float:
+     if not reference or not prediction:
+        return 0.0
+     try:
+        result = bleu_metric.compute(
+            predictions=[prediction],
+            references=[[reference]],
+            max_order=4,
+            smooth=True
+        )
+        return float(result["bleu"])
+     except Exception:
+        return 0.0
+
+    bleu_scores = []
+    for pred, ref in zip(all_predictions, all_references):
+      score = compute_sentence_bleu(ref, pred)
+      bleu_scores.append(score)
+
+    bleu4_score = float(np.mean(bleu_scores))
     bertscore_result = bertscore_metric.compute(
         predictions=all_predictions,
         references=all_references,
@@ -176,7 +195,7 @@ def evaluate_refinement_model():
         })
     results["samples"] = samples
     
-    output_path = Path("./results/refinement_eval_results.json")
+    output_path = Path(f"./results/refinement_eval_results_{config['spoiler_type']}.json")
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with open(output_path, "w") as f:
         json.dump(results, f, indent=2)

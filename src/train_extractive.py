@@ -16,12 +16,7 @@ from transformers import get_scheduler
 import os
 import yaml
 
-'''config = dict(
-    epochs=5,
-    classes=3,
-    batch_size=4,
-    learning_rate=1e-5,
-    model="roberta-base")'''
+
 
 default_config = dict(
     # modeling / tokenization
